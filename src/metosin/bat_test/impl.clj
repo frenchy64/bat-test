@@ -1,12 +1,15 @@
 (ns metosin.bat-test.impl
   (:require [clojure.tools.namespace.dir :as dir]
+            [clojure.tools.namespace.find :as find]
             [clojure.tools.namespace.track :as track]
             [clojure.tools.namespace.reload :as reload]
+            [clojure.java.io :as io]
             [clojure.java.shell :refer [sh]]
             [clojure.string :as string]
             [eftest.runner :as runner]
             [eftest.report :as report]
-            [metosin.bat-test.util :as util]))
+            [metosin.bat-test.util :as util])
+  (:import [java.util.regex Pattern]))
 
 (def tracker (atom nil))
 (def running (atom false))
@@ -22,14 +25,16 @@
         (recur (read-in))))))
 
 (defn enter-key-listener
-  [opts]
-  (util/dbug "Listening to the enter key\n")
-  (on-keypress
-   java.awt.event.KeyEvent/VK_ENTER
-   (fn [_]
-     (when-not @running
-       (util/info "Running all tests\n")
-       (run-all opts)))))
+  ([opts] (enter-key-listener opts #'run-all))
+  ([opts run-all]
+   (when (:enter-key-listener opts)
+     (util/dbug "Listening to the enter key\n")
+     (on-keypress
+       java.awt.event.KeyEvent/VK_ENTER
+       (fn [_]
+         (when-not @running
+           (util/info "Running all tests\n")
+           (run-all opts)))))))
 
 (defn load-only-loaded-and-test-ns
   [{:keys [::track/load] :as tracker} test-matcher]
@@ -95,42 +100,88 @@
     :else (constantly true)))
 
 (defn namespaces-match [selected-namespaces nss]
-  (if (seq selected-namespaces)
-    (filter (set selected-namespaces) nss)
-    nss))
+  (cond->> nss
+    (seq selected-namespaces) (filter (set selected-namespaces))))
 
 (defn selectors-match [selectors vars]
-  (if (seq selectors)
+  (cond->> vars
+    (seq selectors)
     (filter (fn [var]
               (some (fn [[selector args]]
-                      (apply (eval (if (vector? selector)
-                                     (second selector)
-                                     selector))
+                      (apply (eval (cond-> selector
+                                     (vector? selector) second))
                              (merge (-> var meta :ns meta)
                                     (assoc (meta var) :leiningen.test/var var))
                              args))
-                    selectors))
-            vars)
-    vars))
+                    selectors)))))
 
 (defn maybe-run-cloverage [run-tests opts changed-ns test-namespaces]
   (if (:cloverage opts)
-    (do (require 'metosin.bat-test.cloverage)
-
-        ((resolve 'metosin.bat-test.cloverage/wrap-cloverage)
-         ;; Don't instrument -test namespaces
-         (remove #(contains? (set test-namespaces) %) changed-ns)
-         (:cloverage-opts opts)
-         run-tests))
+    ((requiring-resolve 'metosin.bat-test.cloverage/wrap-cloverage)
+     ;; Don't instrument -test namespaces
+     (remove #(contains? (set test-namespaces) %) changed-ns)
+     (:cloverage-opts opts)
+     run-tests)
     (run-tests)))
 
+(defn test-matcher-only-in-directories [test-matcher
+                                        test-dirs]
+  {:pre [(or (instance? java.util.regex.Pattern test-matcher)
+             (string? test-matcher))
+         (or (nil? test-dirs)
+             (string? test-dirs)
+             (coll? test-dirs))]
+   :post [(instance? java.util.regex.Pattern %)]}
+  (let [test-dirs (cond-> test-dirs
+                    (string? test-dirs) vector)
+        re-and (fn [rs]
+                 {:pre [(every? #(instance? java.util.regex.Pattern %) rs)]
+                  :post [(instance? java.util.regex.Pattern %)]}
+                 (case (count rs)
+                   0 #".*"
+                   1 (first rs)
+                   ;; lookaheads
+                   ;; https://www.ocpsoft.org/tutorials/regular-expressions/and-in-regex/
+                   ;; https://stackoverflow.com/a/470602
+                   (re-pattern (str "^"
+                                    (apply str (map #(str "(?=" % ")") rs))
+                                    ".*" ;; I think lookaheads don't consume anything..or something. see SO answer.
+                                    "$"))))]
+    (re-and
+      (remove nil?
+              [(cond-> test-matcher
+                 (string? test-matcher) re-pattern)
+               ;; if test-dirs is nil, don't change test-matcher
+               ;; otherwise, it's a seqable of zero or more directories that a test must
+               ;; be in to run.
+               (when (some? test-dirs)
+                 ;; both restricts the tests being run and stops
+                 ;; bat-test.impl/load-only-loaded-and-test-ns from loading
+                 ;; all test namespaces if only a subset are specified by
+                 ;; `test-dirs`.
+                 (if-some [matching-ns-res (->> test-dirs
+                                                (map io/file)
+                                                find/find-namespaces
+                                                (map name)
+                                                ;; TODO may want to further filter these files via a pattern
+                                                ;(filter #(string/includes? % "test"))
+                                                (map #(str "^" (Pattern/compile % Pattern/LITERAL) "$"))
+                                                seq)]
+                   (->> matching-ns-res
+                        (string/join "|")
+                        re-pattern)
+                   ;; no namespaces in these directories, match nothing
+                   ;;   https://stackoverflow.com/a/2930209
+                   ;;   negative lookahead that matches anything. never matches.
+                   #"(?!.*)"))]))))
+
 (defn reload-and-test
-  [tracker {:keys [on-start test-matcher parallel? report selectors namespaces]
+  [tracker {:keys [on-start test-matcher parallel? report selectors namespaces test-dirs]
             :or {report :progress
                  test-matcher #".*test"}
             :as opts}]
-  (let [parallel? (true? parallel?)
-
+  (let [test-matcher (test-matcher-only-in-directories test-matcher test-dirs)
+        parallel? (true? parallel?)
         changed-ns (::track/load @tracker)
         test-namespaces (->> changed-ns
                              (filter #(re-matches test-matcher (name %)))
@@ -163,7 +214,7 @@
                 (selectors-match selectors)
                 (filter (resolve-hook (:filter opts))))
            (-> opts
-               (dissoc :parallel? :on-start :on-end :filter :test-matcher :selectors)
+               (dissoc :parallel? :on-start :on-end :filter :test-matcher :selectors :test-dirs)
                (assoc :multithread? parallel?
                       :report (resolve-reporter report)))))
        opts
@@ -191,16 +242,14 @@
             (util/warn "Exception: %s\n" (.getMessage e))))))) )
 
 (defn run [{:keys [on-end watch-directories notify-command] :as opts}]
+  ;(prn `run opts)
   (try
     (reset! running true)
     (swap! tracker (fn [tracker]
                      (util/dbug "Scan directories: %s\n" (pr-str watch-directories))
                      (dir/scan-dirs (or tracker (track/tracker)) watch-directories)))
-
     (let [summary (reload-and-test tracker opts)]
-
       (run-notify-command notify-command summary)
-
       summary)
     (finally
       ((resolve-hook on-end))

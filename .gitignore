@@ -10,3 +10,6 @@ pom.xml.asc
 .hgignore
 .hg/
 .nrepl-history
+.cpcache
+test-projects/*/target
+.lein-failures

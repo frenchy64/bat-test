@@ -31,20 +31,25 @@
 
   Default reporter is :progress."
   [m test-matcher VAL regex "Regex used to select test namespaces (default #\".*test\")"
+   d test-dirs VAL edn "Path or vector of paths restricting the tests that will be matched. Relative to project root (default `nil`, no restrictions)"
    p parallel         bool  "Run tests parallel (default off)"
    r report       VAL edn   "Reporting function"
    f filter       VAL sym   "Function to filter the test vars"
    s on-start     VAL sym   "Function to be called before running tests (after reloading namespaces)"
    e on-end       VAL sym   "Function to be called after running tests"
    c cloverage        bool  "Enable Cloverage coverage report (default off)"
+   l enter-key-listener bool   "If true, refresh tracker on enter key (default true). Only meaningful when `parallel` is true."
    _ cloverage-opts VAL edn "Cloverage options"]
   (let [p (-> (core/get-env)
               (update-in [:dependencies] into deps)
               pod/make-pod
               future)
-        opts (assoc *opts*
-                    :verbosity (deref util/*verbosity*)
-                    :watch-directories (:directories pod/env))]
+        opts (-> {:enter-key-listener true}
+                 (into *opts*)
+                 (assoc :verbosity (deref util/*verbosity*)
+                        :watch-directories (:directories pod/env))
+                 (cond-> 
+                   (some? test-dirs) (assoc :test-dirs test-dirs)))]
     (fn [handler]
       (System/setProperty "java.awt.headless" "true")
       (pod/with-call-in @p (metosin.bat-test.impl/enter-key-listener ~opts))
